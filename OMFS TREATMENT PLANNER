@@ -1,0 +1,747 @@
+
+/**
+ * OMFS Treatment Planner – v1.0 (client-only)
+ * ---------------------------------------------------------------------------------
+ * Purpose: Generate tailored, checklist-style treatment plans for common OMFS scenarios
+ * from structured patient inputs. Designed as a decision-support tool (not a
+ * substitute for clinical judgment). All logic runs in-browser; no backend required.
+ *
+ * How to use
+ * - Select a case type.
+ * - Enter patient demographics, vitals, comorbidities, meds, allergies, imaging, etc.
+ * - Fill case-specific fields (they change per case type).
+ * - Click “Generate Plan”. Review, copy, or export.
+ *
+ * Safety & Regulatory
+ * - For decision-support only. Not medical advice.
+ * - Always correlate clinically, follow local protocols, consult seniors/MDT.
+ * - Red-flag triggers are intentionally conservative.
+ *
+ * Extend
+ * - Add new case types in CASE_TEMPLATES (fields + rule engine).
+ * - Adjust red flags and plans in getPlanForCase().
+ */
+
+const CASE_TYPES = [
+  { id: "odontogenic_infection", label: "Odontogenic Infection / Fascial Space" },
+  { id: "mandible_fracture", label: "Mandibular Fracture" },
+  { id: "zmc_fracture", label: "Zygomaticomaxillary Complex (ZMC) Fracture" },
+  { id: "lefort_fracture", label: "Le Fort I/II/III Fracture" },
+  { id: "third_molar", label: "Impacted Mandibular Third Molar" },
+  { id: "tmj_internal_derangement", label: "TMJ Internal Derangement" },
+  { id: "jaw_cyst_benign", label: "Jaw Cyst (Benign-appearing)" },
+  { id: "cleft_vpi", label: "Cleft – Velopharyngeal Insufficiency (VPI)" },
+];
+
+const ASA_OPTIONS = ["I", "II", "III", "IV" ];
+
+const defaultPatient = {
+  name: "",
+  age: "",
+  sex: "",
+  weightKg: "",
+  heightCm: "",
+  asa: "",
+  allergies: "",
+  comorbidities: "",
+  meds: "",
+  vitals: { hr: "", bpSys: "", bpDia: "", temp: "", spo2: "" },
+  fastingHours: "",
+  imaging: { opg: false, cbct: false, ct: false, mri: false, paMand: false, waters: false },
+  otherNotes: "",
+};
+
+const CASE_TEMPLATES = {
+  odontogenic_infection: {
+    fields: {
+      spacesInvolved: [], // e.g. submandibular, sublingual, buccal, pterygomandibular, masticator, lateral pharyngeal, retropharyngeal
+      airwayThreat: false,
+      trismusMm: "",
+      dysphagia: false,
+      dehydration: false,
+      diabetes: false,
+      pregnancy: false,
+      penicillinAllergy: false,
+      durationDays: "",
+      priorAntibiotics: "",
+      sourceTooth: "",
+      sepsisCriteria: false,
+    },
+  },
+  mandible_fracture: {
+    fields: {
+      subsite: "", // symphysis, parasymphysis, body, angle, ramus, condyle, coronoid
+      favorability: "", // favorable/unfavorable/unknown
+      dentate: true,
+      displacement: "", // minimal/moderate/severe
+      malocclusion: false,
+      openFracture: false,
+      neuroDeficit: false,
+      timeSinceInjuryDays: "",
+      poorHygieneOrSepsis: false,
+    },
+  },
+  zmc_fracture: {
+    fields: {
+      diplopia: false,
+      enophthalmos: false,
+      restrictedGaze: false,
+      infraorbitalNumbness: false,
+      occlusalChange: false,
+      trismus: false,
+      displacement: "", // minimal/moderate/severe
+      timeSinceInjuryDays: "",
+    },
+  },
+  lefort_fracture: {
+    fields: {
+      level: "", // I/II/III
+      mobility: false,
+      csfRhinorrhea: false,
+      malocclusion: false,
+      airwayCompromise: false,
+      ocularInjury: false,
+      timeSinceInjuryDays: "",
+    },
+  },
+  third_molar: {
+    fields: {
+      pellGregory: "",
+      winterClassification: "",
+      proximityIAN: "", // clear/seems close/overlapping
+      pericoronitis: false,
+      trismus: false,
+      deepImpaction: false,
+      ageOver30: false,
+      coagulopathy: false,
+      plannedSedation: false,
+    },
+  },
+  tmj_internal_derangement: {
+    fields: {
+      painVAS: "",
+      mouthOpeningMm: "",
+      jointSounds: false,
+      locking: false,
+      durationWeeks: "",
+      failedConservativeWeeks: "",
+      bruxism: false,
+      anxietyOrStress: false,
+    },
+  },
+  jaw_cyst_benign: {
+    fields: {
+      suspectedType: "", // radicular/OKC/dentigerous/simple bone cyst/other
+      sizeCm: "",
+      corticalExpansion: false,
+      proximityVitalStructures: false,
+      recurrent: false,
+      infection: false,
+      ageUnder18: false,
+    },
+  },
+  cleft_vpi: {
+    fields: {
+      ageYears: "",
+      hypernasalityGrade: "", // mild/moderate/severe
+      speechTherapyTriedMonths: "",
+      fistula: false,
+      tonsillarHypertrophy: false,
+      syndromicFeatures: false,
+      sleepDisorderedBreathing: false,
+      imagingOrEndoscopyAvailable: false,
+    },
+  },
+};
+
+function Badge({ children }) {
+  return (
+    <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium">
+      {children}
+    </span>
+  );
+}
+
+function Section({ title, children, right }) {
+  return (
+    <div className="bg-white/70 rounded-2xl shadow-sm border p-4 md:p-6 mb-4">
+      <div className="flex items-start justify-between gap-4 mb-3">
+        <h2 className="text-lg md:text-xl font-semibold">{title}</h2>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Input({ label, value, onChange, type = "text", placeholder = "", className = "" }) {
+  return (
+    <label className={`block text-sm mb-2 ${className}`}>
+      <span className="block text-gray-700 mb-1">{label}</span>
+      <input
+        type={type}
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-xl border px-3 py-2 focus:outline-none focus:ring-2"
+      />
+    </label>
+  );
+}
+
+function Checkbox({ label, checked, onChange }) {
+  return (
+    <label className="flex items-center gap-2 text-sm mb-2">
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span>{label}</span>
+    </label>
+  );
+}
+
+function Textarea({ label, value, onChange, rows = 3 }) {
+  return (
+    <label className="block text-sm mb-2">
+      <span className="block text-gray-700 mb-1">{label}</span>
+      <textarea
+        rows={rows}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-xl border px-3 py-2 focus:outline-none focus:ring-2"
+      />
+    </label>
+  );
+}
+
+function Divider() {
+  return <div className="h-px w-full bg-gray-200 my-3" />;
+}
+
+/** Utility helpers */
+const num = (v) => {
+  const n = parseFloat(v);
+  return isNaN(n) ? undefined : n;
+};
+
+const any = (...vals) => vals.some(Boolean);
+
+/** Risk / red-flag engine */
+function computeRedFlags(patient, caseId, caseFields) {
+  const flags = [];
+  const t = (s) => ({ label: s, level: "high" });
+
+  // generic
+  const temp = num(patient.vitals.temp);
+  const spo2 = num(patient.vitals.spo2);
+  const sys = num(patient.vitals.bpSys);
+  const hr = num(patient.vitals.hr);
+
+  if (temp !== undefined && temp >= 38.5) flags.push(t("Fever ≥ 38.5°C"));
+  if (spo2 !== undefined && spo2 < 94) flags.push(t("SpO₂ < 94%"));
+  if (sys !== undefined && sys < 90) flags.push(t("Systolic BP < 90 mmHg (shock)"));
+  if (hr !== undefined && hr > 120) flags.push(t("Tachycardia > 120 bpm"));
+
+  if (patient.asa && ["III", "IV"].includes(patient.asa)) flags.push(t(`High ASA (${patient.asa})`));
+
+  // case-specific
+  switch (caseId) {
+    case "odontogenic_infection": {
+      if (caseFields.airwayThreat) flags.push(t("Airway threat (floor of mouth elevation/stridor)"));
+      if (any(caseFields.dysphagia, caseFields.sepsisCriteria)) flags.push(t("Systemic toxicity/Sepsis risk"));
+      const trismus = num(caseFields.trismusMm);
+      if (trismus !== undefined && trismus < 20) flags.push(t("Severe trismus < 20 mm"));
+      break;
+    }
+    case "mandible_fracture": {
+      if (caseFields.openFracture) flags.push(t("Open fracture – contamination risk"));
+      if (caseFields.malocclusion) flags.push(t("New malocclusion"));
+      break;
+    }
+    case "zmc_fracture": {
+      if (any(caseFields.diplopia, caseFields.restrictedGaze)) flags.push(t("Ocular involvement – urgent ophthalmology"));
+      break;
+    }
+    case "lefort_fracture": {
+      if (any(caseFields.airwayCompromise, caseFields.csfRhinorrhea, caseFields.ocularInjury)) flags.push(t("Airway/CNS/ocular red flags"));
+      break;
+    }
+    case "third_molar": {
+      if (caseFields.coagulopathy) flags.push(t("Bleeding risk – coagulopathy"));
+      break;
+    }
+    case "tmj_internal_derangement": {
+      const mo = num(caseFields.mouthOpeningMm);
+      if (mo !== undefined && mo < 25) flags.push(t("Severely limited opening"));
+      if (caseFields.locking) flags.push(t("Intermittent/closed lock"));
+      break;
+    }
+    case "jaw_cyst_benign": {
+      if (caseFields.proximityVitalStructures) flags.push(t("Close to vital structures (IAN, sinus, nasal floor)"));
+      break;
+    }
+    case "cleft_vpi": {
+      if (caseFields.sleepDisorderedBreathing) flags.push(t("Sleep-disordered breathing – consider sleep study/ENT"));
+      break;
+    }
+    default:
+      break;
+  }
+  return flags;
+}
+
+/** Plan generator */
+function getPlanForCase(patient, caseId, f) {
+  // Returns structured plan blocks { title, items[] }
+  const blocks = [];
+  const add = (title, items) => blocks.push({ title, items: items.filter(Boolean) });
+
+  const bmi = (() => {
+    const w = num(patient.weightKg);
+    const h = num(patient.heightCm);
+    if (!w || !h) return undefined;
+    const m = h / 100;
+    const b = w / (m * m);
+    return b.toFixed(1);
+  })();
+
+  // Generic pre-op
+  add("Pre-op / Baseline", [
+    patient.asa ? `ASA ${patient.asa}` : "ASA to be assessed",
+    bmi ? `BMI ${bmi}` : "Record height/weight for BMI",
+    patient.allergies ? `Allergies: ${patient.allergies}` : "Document drug/latex allergies",
+    patient.comorbidities ? `Comorbidities: ${patient.comorbidities}` : "Screen comorbidities (DM, HTN, CAD, asthma)",
+    patient.meds ? `Meds: ${patient.meds}` : "List medications (anticoagulants, steroids, OCP)",
+    "Informed consent with risks/benefits/alternatives",
+  ]);
+
+  // Case-specific logic
+  switch (caseId) {
+    case "odontogenic_infection": {
+      const severe = f.airwayThreat || f.sepsisCriteria || (num(f.trismusMm) !== undefined && num(f.trismusMm) < 20);
+      add("Immediate", [
+        severe ? "Admit for IV antibiotics, fluids, and airway monitoring" : "Outpatient management if stable",
+        f.diabetes ? "Tight glycaemic control; check random glucose/HbA1c" : "",
+        f.airwayThreat ? "Early anesthesiology/ENT consult; prepare for awake fiberoptic if needed" : "",
+      ]);
+      add("Investigations", [
+        (f.spacesInvolved?.length || 0) > 0 ? "Contrast-enhanced CT if deep spaces suspected" : "OPG/PA + USG where applicable",
+        "Baseline labs: CBC, CRP; culture if purulent drainage",
+      ]);
+      add("Source control", [
+        f.sourceTooth ? `Extract/Drain source tooth #${f.sourceTooth}` : "Identify and remove offending tooth",
+        "Incision & drainage with dependent drains; break loculations",
+        "Hydration, analgesia, mouth opening physiotherapy after acute phase",
+      ]);
+      add("Antibiotics (example; local protocols prevail)", [
+        f.penicillinAllergy ? "Clindamycin + Metronidazole" : "Amoxicillin-clavulanate ± Metronidazole",
+        "Escalate per culture/sensitivity; typical 5–7 days post-source control",
+      ]);
+      add("Disposition & Follow-up", [
+        severe ? "Inpatient until afebrile, trismus improving, tolerating PO" : "Review 24–48h; strict return precautions",
+      ]);
+      break;
+    }
+    case "mandible_fracture": {
+      const operative = f.malocclusion || f.displacement === "moderate" || f.displacement === "severe" || f.openFracture;
+      add("Workup", [
+        "OPG and CT (mandible protocol) to define pattern",
+        f.openFracture ? "Tetanus, wound irrigation/debridement, IV antibiotics" : "",
+        "Dental consult for occlusion records/spacers if needed",
+      ]);
+      add("Management", [
+        operative ? "ORIF with miniplates/3D plates per Champy/anion per site" : "Closed reduction/MMF 2–4 weeks if favorable and compliant",
+        f.subsite === "condyle" ? "Consider conservative vs ORIF based on displacement, occlusion, age" : "",
+        f.poorHygieneOrSepsis ? "Delay definitive fixation until infection controlled" : "",
+      ]);
+      add("Post-op", [
+        "Soft diet, oral hygiene, chlorhexidine rinses",
+        "Physiotherapy if MMF avoided/after release",
+        "Review 1 week, then 4–6 weeks with OPG",
+      ]);
+      break;
+    }
+    case "zmc_fracture": {
+      const needsOp = f.enophthalmos || f.diplopia || f.restrictedGaze || f.displacement === "severe";
+      add("Workup", [
+        "CT Face (axial/coronal/3D). Ophthalmology assessment",
+        "Document infraorbital nerve status, globe position, diplopia fields",
+      ]);
+      add("Management", [
+        needsOp ? "ORIF via lateral brow/infraorbital/gingivobuccal approaches; restore buttresses" : "Conservative: soft diet, avoid nose blowing, decongestants",
+      ]);
+      add("Follow-up", [
+        "Reassess enophthalmos/diplopia at 1–2 weeks; consider delayed correction if persistent",
+      ]);
+      break;
+    }
+    case "lefort_fracture": {
+      add("ATLS & Airway", [
+        f.airwayCompromise ? "Secure airway early (consider awake techniques)" : "Airway patent; monitor",
+        f.csfRhinorrhea ? "Neurosurgery input; CSF leak precautions" : "",
+      ]);
+      add("Workup", [
+        "CT midface (3D). Ophthalmology/ENT as indicated",
+        f.malocclusion ? "Dental impressions/occlusal records" : "",
+      ]);
+      add("Definitive", [
+        f.mobility || f.malocclusion ? "ORIF with occlusal-first sequence; restore vertical/anteroposterior buttresses" : "Conservative if stable, non-mobile, good occlusion",
+      ]);
+      add("Post-op", [
+        "Soft diet 4–6 weeks, nasal decongestants, avoid nose blowing",
+        "Review 1–2 weeks, then 6 weeks",
+      ]);
+      break;
+    }
+    case "third_molar": {
+      const difficult = f.deepImpaction || f.ageOver30 || f.proximityIAN === "overlapping";
+      add("Pre-op", [
+        f.pericoronitis ? "Treat acute infection first (irrigation + antibiotics per protocol)" : "",
+        "Explain risks: IAN/LN injury, dry socket, trismus",
+        f.plannedSedation ? "Pre-sedation fasting, escort, ASA II+ anesth consult if needed" : "",
+      ]);
+      add("Surgical Plan", [
+        difficult ? "Senior operator; consider coronectomy if close IAN" : "Standard triangular flap with bone guttering",
+        "Atraumatic technique; copious irrigation; primary closure if indicated",
+      ]);
+      add("Post-op", [
+        "Analgesia protocol; consider NSAID + acetaminophen",
+        "Chlorhexidine rinses after 24h; ice for swelling first 24–48h",
+        "Review 7–10 days; red flags explained",
+      ]);
+      break;
+    }
+    case "tmj_internal_derangement": {
+      const failedCons = Number(f.failedConservativeWeeks || 0) >= 6;
+      add("Initial", [
+        "Education, soft diet, warm compresses, jaw exercises",
+        "Occlusal splint/night guard if bruxism",
+        "NSAIDs ± short muscle relaxant course; address stress/anxiety",
+      ]);
+      add("If persistent", [
+        failedCons ? "Consider arthrocentesis/arthroscopy; MRI if diagnostic uncertainty" : "Continue conservative up to 6–12 weeks",
+      ]);
+      add("Follow-up", [
+        "Physiotherapy referral; review at 4–6 weeks",
+      ]);
+      break;
+    }
+    case "jaw_cyst_benign": {
+      const large = num(f.sizeCm) !== undefined && num(f.sizeCm) >= 3;
+      add("Workup", [
+        "OPG ± CBCT; vitality testing of adjacent teeth",
+        "Incisional/excisional biopsy depending on size/location",
+      ]);
+      add("Management", [
+        f.suspectedType === "OKC" ? "Enucleation with peripheral ostectomy ± Carnoy's; consider marsupialization if large" : "Enucleation/curettage as indicated",
+        large ? "Marsupialization/decompression for large lesions near vital structures" : "",
+      ]);
+      add("Follow-up", [
+        f.suspectedType === "OKC" ? "Long-term surveillance (≥5 years) due to recurrence risk" : "Periodic radiographic review",
+      ]);
+      break;
+    }
+    case "cleft_vpi": {
+      const severe = f.hypernasalityGrade === "severe";
+      add("Assessment", [
+        "Perceptual speech evaluation (specialist SLP)",
+        f.imagingOrEndoscopyAvailable ? "Nasendoscopy and/or videofluoroscopy to define VP gap pattern" : "Arrange nasendoscopy/videofluoroscopy",
+        f.tonsillarHypertrophy ? "ENT assessment for adenotonsillar status" : "",
+      ]);
+      add("Management Ladder", [
+        Number(f.speechTherapyTriedMonths || 0) < 6 ? "Continue/optimize speech therapy (≥6 months)" : "",
+        severe ? "Consider surgical option based on closure pattern: pharyngeal flap, sphincter pharyngoplasty, or Furlow palatoplasty revision" : "If persistent moderate VPI post-therapy: consider surgery",
+      ]);
+      add("Peri-op Considerations", [
+        f.syndromicFeatures ? "Genetic/airway evaluation in MDT" : "",
+        "Sleep study if OSA risk before flap procedures",
+      ]);
+      add("Follow-up", [
+        "Post-op speech therapy essential; objective reassessment at 3–6 months",
+      ]);
+      break;
+    }
+    default:
+      add("Plan", ["No case selected"]);
+  }
+
+  // Universal discharge/education
+  add("Safety Net", [
+    "This tool is for decision-support; follow local protocols and senior guidance.",
+    "Escalate if airway compromise, progressive swelling, uncontrolled pain/bleeding, vision changes, fever, or new neurological signs.",
+  ]);
+
+  return blocks;
+}
+
+function CaseSpecificFields({ caseId, state, setState }) {
+  if (!caseId) return null;
+  const f = state;
+
+  const L = ({ children }) => <div className="grid grid-cols-1 md:grid-cols-2 gap-3">{children}</div>;
+
+  switch (caseId) {
+    case "odontogenic_infection":
+      return (
+        <L>
+          <Input label="Spaces involved (comma-separated)" value={(f.spacesInvolved||[]).join(", ")} onChange={(v)=> setState({ ...f, spacesInvolved: v.split(",").map(s=>s.trim()).filter(Boolean) })} />
+          <Input label="Trismus (mm)" value={f.trismusMm} onChange={(v)=> setState({ ...f, trismusMm: v })} />
+          <Checkbox label="Airway threat" checked={f.airwayThreat} onChange={(v)=> setState({ ...f, airwayThreat: v })} />
+          <Checkbox label="Dysphagia" checked={f.dysphagia} onChange={(v)=> setState({ ...f, dysphagia: v })} />
+          <Checkbox label="Dehydration" checked={f.dehydration} onChange={(v)=> setState({ ...f, dehydration: v })} />
+          <Checkbox label="Diabetes" checked={f.diabetes} onChange={(v)=> setState({ ...f, diabetes: v })} />
+          <Checkbox label="Pregnancy" checked={f.pregnancy} onChange={(v)=> setState({ ...f, pregnancy: v })} />
+          <Checkbox label="Penicillin allergy" checked={f.penicillinAllergy} onChange={(v)=> setState({ ...f, penicillinAllergy: v })} />
+          <Input label="Duration (days)" value={f.durationDays} onChange={(v)=> setState({ ...f, durationDays: v })} />
+          <Input label="Prior antibiotics" value={f.priorAntibiotics} onChange={(v)=> setState({ ...f, priorAntibiotics: v })} />
+          <Input label="Source tooth #" value={f.sourceTooth} onChange={(v)=> setState({ ...f, sourceTooth: v })} />
+          <Checkbox label="Sepsis criteria present" checked={f.sepsisCriteria} onChange={(v)=> setState({ ...f, sepsisCriteria: v })} />
+        </L>
+      );
+    case "mandible_fracture":
+      return (
+        <L>
+          <Input label="Subsite" value={f.subsite} onChange={(v)=> setState({ ...f, subsite: v })} placeholder="angle/body/parasymphysis/etc" />
+          <Input label="Favorability" value={f.favorability} onChange={(v)=> setState({ ...f, favorability: v })} placeholder="favorable/unfavorable/unknown" />
+          <Checkbox label="Dentate" checked={f.dentate} onChange={(v)=> setState({ ...f, dentate: v })} />
+          <Input label="Displacement" value={f.displacement} onChange={(v)=> setState({ ...f, displacement: v })} placeholder="minimal/moderate/severe" />
+          <Checkbox label="Malocclusion" checked={f.malocclusion} onChange={(v)=> setState({ ...f, malocclusion: v })} />
+          <Checkbox label="Open fracture" checked={f.openFracture} onChange={(v)=> setState({ ...f, openFracture: v })} />
+          <Checkbox label="Neurosensory deficit" checked={f.neuroDeficit} onChange={(v)=> setState({ ...f, neuroDeficit: v })} />
+          <Input label="Time since injury (days)" value={f.timeSinceInjuryDays} onChange={(v)=> setState({ ...f, timeSinceInjuryDays: v })} />
+          <Checkbox label="Poor hygiene/Infection" checked={f.poorHygieneOrSepsis} onChange={(v)=> setState({ ...f, poorHygieneOrSepsis: v })} />
+        </L>
+      );
+    case "zmc_fracture":
+      return (
+        <L>
+          <Checkbox label="Diplopia" checked={f.diplopia} onChange={(v)=> setState({ ...f, diplopia: v })} />
+          <Checkbox label="Enophthalmos" checked={f.enophthalmos} onChange={(v)=> setState({ ...f, enophthalmos: v })} />
+          <Checkbox label="Restricted gaze" checked={f.restrictedGaze} onChange={(v)=> setState({ ...f, restrictedGaze: v })} />
+          <Checkbox label="Infraorbital numbness" checked={f.infraorbitalNumbness} onChange={(v)=> setState({ ...f, infraorbitalNumbness: v })} />
+          <Checkbox label="Occlusal change" checked={f.occlusalChange} onChange={(v)=> setState({ ...f, occlusalChange: v })} />
+          <Checkbox label="Trismus" checked={f.trismus} onChange={(v)=> setState({ ...f, trismus: v })} />
+          <Input label="Displacement" value={f.displacement} onChange={(v)=> setState({ ...f, displacement: v })} placeholder="minimal/moderate/severe" />
+          <Input label="Time since injury (days)" value={f.timeSinceInjuryDays} onChange={(v)=> setState({ ...f, timeSinceInjuryDays: v })} />
+        </L>
+      );
+    case "lefort_fracture":
+      return (
+        <L>
+          <Input label="Level" value={f.level} onChange={(v)=> setState({ ...f, level: v })} placeholder="I / II / III" />
+          <Checkbox label="Segment mobility" checked={f.mobility} onChange={(v)=> setState({ ...f, mobility: v })} />
+          <Checkbox label="CSF rhinorrhea" checked={f.csfRhinorrhea} onChange={(v)=> setState({ ...f, csfRhinorrhea: v })} />
+          <Checkbox label="Malocclusion" checked={f.malocclusion} onChange={(v)=> setState({ ...f, malocclusion: v })} />
+          <Checkbox label="Airway compromise" checked={f.airwayCompromise} onChange={(v)=> setState({ ...f, airwayCompromise: v })} />
+          <Checkbox label="Ocular injury" checked={f.ocularInjury} onChange={(v)=> setState({ ...f, ocularInjury: v })} />
+          <Input label="Time since injury (days)" value={f.timeSinceInjuryDays} onChange={(v)=> setState({ ...f, timeSinceInjuryDays: v })} />
+        </L>
+      );
+    case "third_molar":
+      return (
+        <L>
+          <Input label="Pell & Gregory" value={f.pellGregory} onChange={(v)=> setState({ ...f, pellGregory: v })} />
+          <Input label="Winter classification" value={f.winterClassification} onChange={(v)=> setState({ ...f, winterClassification: v })} />
+          <Input label="Proximity to IAN" value={f.proximityIAN} onChange={(v)=> setState({ ...f, proximityIAN: v })} placeholder="clear/seems close/overlapping" />
+          <Checkbox label="Pericoronitis" checked={f.pericoronitis} onChange={(v)=> setState({ ...f, pericoronitis: v })} />
+          <Checkbox label="Trismus" checked={f.trismus} onChange={(v)=> setState({ ...f, trismus: v })} />
+          <Checkbox label="Deep impaction" checked={f.deepImpaction} onChange={(v)=> setState({ ...f, deepImpaction: v })} />
+          <Checkbox label=">30 years" checked={f.ageOver30} onChange={(v)=> setState({ ...f, ageOver30: v })} />
+          <Checkbox label="Coagulopathy" checked={f.coagulopathy} onChange={(v)=> setState({ ...f, coagulopathy: v })} />
+          <Checkbox label="Planned sedation" checked={f.plannedSedation} onChange={(v)=> setState({ ...f, plannedSedation: v })} />
+        </L>
+      );
+    case "tmj_internal_derangement":
+      return (
+        <L>
+          <Input label="Pain (VAS/10)" value={f.painVAS} onChange={(v)=> setState({ ...f, painVAS: v })} />
+          <Input label="Mouth opening (mm)" value={f.mouthOpeningMm} onChange={(v)=> setState({ ...f, mouthOpeningMm: v })} />
+          <Checkbox label="Joint sounds" checked={f.jointSounds} onChange={(v)=> setState({ ...f, jointSounds: v })} />
+          <Checkbox label="Locking" checked={f.locking} onChange={(v)=> setState({ ...f, locking: v })} />
+          <Input label="Duration (weeks)" value={f.durationWeeks} onChange={(v)=> setState({ ...f, durationWeeks: v })} />
+          <Input label="Failed conservative (weeks)" value={f.failedConservativeWeeks} onChange={(v)=> setState({ ...f, failedConservativeWeeks: v })} />
+          <Checkbox label="Bruxism" checked={f.bruxism} onChange={(v)=> setState({ ...f, bruxism: v })} />
+          <Checkbox label="Anxiety/Stress" checked={f.anxietyOrStress} onChange={(v)=> setState({ ...f, anxietyOrStress: v })} />
+        </L>
+      );
+    case "jaw_cyst_benign":
+      return (
+        <L>
+          <Input label="Suspected type" value={f.suspectedType} onChange={(v)=> setState({ ...f, suspectedType: v })} placeholder="radicular/OKC/dentigerous/etc" />
+          <Input label="Size (cm)" value={f.sizeCm} onChange={(v)=> setState({ ...f, sizeCm: v })} />
+          <Checkbox label="Cortical expansion" checked={f.corticalExpansion} onChange={(v)=> setState({ ...f, corticalExpansion: v })} />
+          <Checkbox label="Near vital structures" checked={f.proximityVitalStructures} onChange={(v)=> setState({ ...f, proximityVitalStructures: v })} />
+          <Checkbox label="Recurrent" checked={f.recurrent} onChange={(v)=> setState({ ...f, recurrent: v })} />
+          <Checkbox label="Infection" checked={f.infection} onChange={(v)=> setState({ ...f, infection: v })} />
+          <Checkbox label="Age < 18" checked={f.ageUnder18} onChange={(v)=> setState({ ...f, ageUnder18: v })} />
+        </L>
+      );
+    case "cleft_vpi":
+      return (
+        <L>
+          <Input label="Age (years)" value={f.ageYears} onChange={(v)=> setState({ ...f, ageYears: v })} />
+          <Input label="Hypernasality grade" value={f.hypernasalityGrade} onChange={(v)=> setState({ ...f, hypernasalityGrade: v })} placeholder="mild/moderate/severe" />
+          <Input label="Speech therapy tried (months)" value={f.speechTherapyTriedMonths} onChange={(v)=> setState({ ...f, speechTherapyTriedMonths: v })} />
+          <Checkbox label="Oronasal fistula" checked={f.fistula} onChange={(v)=> setState({ ...f, fistula: v })} />
+          <Checkbox label="Tonsillar hypertrophy" checked={f.tonsillarHypertrophy} onChange={(v)=> setState({ ...f, tonsillarHypertrophy: v })} />
+          <Checkbox label="Syndromic features" checked={f.syndromicFeatures} onChange={(v)=> setState({ ...f, syndromicFeatures: v })} />
+          <Checkbox label="Sleep-disordered breathing" checked={f.sleepDisorderedBreathing} onChange={(v)=> setState({ ...f, sleepDisorderedBreathing: v })} />
+          <Checkbox label="Imaging/endoscopy available" checked={f.imagingOrEndoscopyAvailable} onChange={(v)=> setState({ ...f, imagingOrEndoscopyAvailable: v })} />
+        </L>
+      );
+    default:
+      return null;
+  }
+}
+
+export default function App() {
+  const [patient, setPatient] = useState(defaultPatient);
+  const [caseId, setCaseId] = useState("");
+  const [caseState, setCaseState] = useState({});
+  const [generated, setGenerated] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const [showDisclaimer, setShowDisclaimer] = useState(true);
+
+  const redFlags = useMemo(() => computeRedFlags(patient, caseId, caseState), [patient, caseId, caseState]);
+
+  const onGenerate = () => {
+    const blocks = getPlanForCase(patient, caseId, caseState);
+    setGenerated({ blocks, ts: new Date().toLocaleString() });
+  };
+
+  const reset = () => {
+    setPatient(defaultPatient);
+    setCaseId("");
+    setCaseState({});
+    setGenerated(null);
+  };
+
+  const copyPlan = async () => {
+    if (!generated) return;
+    const txt = generated.blocks
+      .map(b => `# ${b.title}\n- ` + b.items.join("\n- "))
+      .join("\n\n");
+    await navigator.clipboard.writeText(txt);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-white to-amber-50 p-4 md:p-8">
+      <div className="mx-auto max-w-6xl">
+        <header className="mb-6 flex items-start justify-between">
+          <div>
+            <h1 className="text-2xl md:text-3xl font-bold">OMFS Treatment Planner</h1>
+            <p className="text-sm text-gray-600">Decision-support tool • Client-only • v1.0</p>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={reset} className="px-3 py-2 rounded-xl border hover:bg-gray-50">Reset</button>
+            <button onClick={onGenerate} className="px-3 py-2 rounded-xl bg-black text-white">Generate Plan</button>
+          </div>
+        </header>
+
+        {showDisclaimer && (
+          <div className="mb-4 p-4 rounded-xl border bg-yellow-50 text-sm">
+            <b>Safety notice:</b> This tool is for clinician decision-support only and does not replace clinical judgment, senior supervision, or local hospital protocols. Always adhere to ATLS/ALS principles and your institutional antibiotic and DVT policies.
+            <button onClick={()=> setShowDisclaimer(false)} className="float-right px-2 py-1 rounded-lg border">Dismiss</button>
+          </div>
+        )}
+
+        <Section title="Select Case Type" right={<Badge>{caseId ? CASE_TYPES.find(c=>c.id===caseId)?.label : "Choose"}</Badge>}>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            {CASE_TYPES.map(ct => (
+              <button
+                key={ct.id}
+                onClick={() => { setCaseId(ct.id); setCaseState(CASE_TEMPLATES[ct.id]?.fields || {}); setGenerated(null); }}
+                className={`px-3 py-2 rounded-xl border text-sm text-left hover:bg-gray-50 ${caseId===ct.id ? 'border-black' : ''}`}
+              >{ct.label}</button>
+            ))}
+          </div>
+        </Section>
+
+        <Section title="Patient Intake">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <Input label="Name" value={patient.name} onChange={(v)=> setPatient({ ...patient, name: v })} />
+            <Input label="Age" value={patient.age} onChange={(v)=> setPatient({ ...patient, age: v })} />
+            <Input label="Sex" value={patient.sex} onChange={(v)=> setPatient({ ...patient, sex: v })} />
+            <Input label="Weight (kg)" value={patient.weightKg} onChange={(v)=> setPatient({ ...patient, weightKg: v })} />
+            <Input label="Height (cm)" value={patient.heightCm} onChange={(v)=> setPatient({ ...patient, heightCm: v })} />
+            <label className="block text-sm mb-2">
+              <span className="block text-gray-700 mb-1">ASA</span>
+              <select value={patient.asa} onChange={(e)=> setPatient({ ...patient, asa: e.target.value })} className="w-full rounded-xl border px-3 py-2">
+                <option value="">Select</option>
+                {ASA_OPTIONS.map(a => <option key={a} value={a}>{a}</option>)}
+              </select>
+            </label>
+            <Input label="Allergies" value={patient.allergies} onChange={(v)=> setPatient({ ...patient, allergies: v })} />
+            <Input label="Comorbidities" value={patient.comorbidities} onChange={(v)=> setPatient({ ...patient, comorbidities: v })} />
+            <Input label="Medications" value={patient.meds} onChange={(v)=> setPatient({ ...patient, meds: v })} />
+          </div>
+          <Divider />
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <Input label="HR (bpm)" value={patient.vitals.hr} onChange={(v)=> setPatient({ ...patient, vitals: { ...patient.vitals, hr: v } })} />
+            <Input label="BP Systolic" value={patient.vitals.bpSys} onChange={(v)=> setPatient({ ...patient, vitals: { ...patient.vitals, bpSys: v } })} />
+            <Input label="BP Diastolic" value={patient.vitals.bpDia} onChange={(v)=> setPatient({ ...patient, vitals: { ...patient.vitals, bpDia: v } })} />
+            <Input label="Temp (°C)" value={patient.vitals.temp} onChange={(v)=> setPatient({ ...patient, vitals: { ...patient.vitals, temp: v } })} />
+            <Input label="SpO₂ (%)" value={patient.vitals.spo2} onChange={(v)=> setPatient({ ...patient, vitals: { ...patient.vitals, spo2: v } })} />
+          </div>
+          <Divider />
+          <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
+            <Checkbox label="OPG" checked={patient.imaging.opg} onChange={(v)=> setPatient({ ...patient, imaging: { ...patient.imaging, opg: v } })} />
+            <Checkbox label="PA Mandible" checked={patient.imaging.paMand} onChange={(v)=> setPatient({ ...patient, imaging: { ...patient.imaging, paMand: v } })} />
+            <Checkbox label="CBCT" checked={patient.imaging.cbct} onChange={(v)=> setPatient({ ...patient, imaging: { ...patient.imaging, cbct: v } })} />
+            <Checkbox label="CT" checked={patient.imaging.ct} onChange={(v)=> setPatient({ ...patient, imaging: { ...patient.imaging, ct: v } })} />
+            <Checkbox label="MRI" checked={patient.imaging.mri} onChange={(v)=> setPatient({ ...patient, imaging: { ...patient.imaging, mri: v } })} />
+            <Checkbox label="Water's view" checked={patient.imaging.waters} onChange={(v)=> setPatient({ ...patient, imaging: { ...patient.imaging, waters: v } })} />
+          </div>
+          <Divider />
+          <Textarea label="Other notes" value={patient.otherNotes} onChange={(v)=> setPatient({ ...patient, otherNotes: v })} />
+        </Section>
+
+        <Section title="Case-Specific Details">
+          {caseId ? (
+            <CaseSpecificFields caseId={caseId} state={caseState} setState={setCaseState} />
+          ) : (
+            <div className="text-sm text-gray-600">Choose a case type above to reveal targeted inputs.</div>
+          )}
+        </Section>
+
+        <Section title="Red Flags" right={<Badge>{redFlags.length} alerts</Badge>}>
+          {redFlags.length === 0 ? (
+            <div className="text-sm text-gray-600">No red flags detected based on current inputs. Continue to correlate clinically.</div>
+          ) : (
+            <ul className="list-disc ml-5 text-sm">
+              {redFlags.map((f,i)=> (
+                <li key={i} className="mb-1">{f.label}</li>
+              ))}
+            </ul>
+          )}
+        </Section>
+
+        <Section title="Generated Plan" right={generated ? <Badge>{generated.ts}</Badge> : <Badge>Not generated</Badge>}>
+          {!generated ? (
+            <div className="text-sm text-gray-600">Click <b>Generate Plan</b> to produce a tailored, checklist-style plan. Review and modify for your context.</div>
+          ) : (
+            <div className="space-y-4">
+              {generated.blocks.map((b, idx) => (
+                <div key={idx} className="rounded-xl border p-3">
+                  <div className="font-semibold mb-2">{b.title}</div>
+                  <ul className="list-disc ml-5 text-sm">
+                    {b.items.map((it, j) => (
+                      <li key={j}>{it}</li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+              <div className="flex gap-2">
+                <button onClick={copyPlan} className="px-3 py-2 rounded-xl border">{copied ? "Copied" : "Copy plan"}</button>
+                <button onClick={()=> window.print()} className="px-3 py-2 rounded-xl border">Print / Save as PDF</button>
+              </div>
+            </div>
+          )}
+        </Section>
+
+        <footer className="text-xs text-gray-500 mt-8">© {new Date().getFullYear()} OMFS Planner. For clinical decision-support only. Built for Dr. Soham Lahiri.
+        </footer>
+      </div>
+    </div>
+  );
+}
